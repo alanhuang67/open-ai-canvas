@@ -23,8 +23,11 @@ type videoPollPolicy struct {
 	MaxMalformedResponses int
 	MaxDownloadTries      int
 	RetryTransient        bool
-	Sleep                 func(context.Context, time.Duration) error
-	Notify                func(context.Context, string, videoPollEvent, error)
+	// TransientRetryLimit 只在 RetryTransient=false（fail-fast 策略）时生效：允许连续多少次
+	// 暂时性轮询错误（连接中断、5xx、429 等）后继续查询原任务。0 表示保持 fail-fast。
+	TransientRetryLimit int
+	Sleep               func(context.Context, time.Duration) error
+	Notify              func(context.Context, string, videoPollEvent, error)
 }
 
 type videoPollEvent string
@@ -76,6 +79,7 @@ func runVideoPollLoop(ctx context.Context, taskID string, policy videoPollPolicy
 	notFoundMisses := 0
 	malformedResponses := 0
 	retrying := false
+	transientFailures := 0
 	for time.Now().Before(deadline) {
 		if nextDelay > 0 {
 			if err := policy.Sleep(ctx, nextDelay); err != nil {
@@ -85,7 +89,13 @@ func runVideoPollLoop(ctx context.Context, taskID string, policy videoPollPolicy
 		outcome, err := query(ctx)
 		if err != nil {
 			if !policy.RetryTransient {
-				return nil, err
+				retry, notFound := retryableVideoPollError(ctx, err)
+				if !retry || notFound || isTransientResponseDecodeError(err) || transientFailures >= policy.TransientRetryLimit {
+					return nil, err
+				}
+				transientFailures++
+				nextDelay = max(min(policy.Interval<<(transientFailures-1), 4*policy.Interval), providerRetryAfter(err))
+				continue
 			}
 			retry, notFound := retryableVideoPollError(ctx, err)
 			if !retry {
@@ -117,6 +127,7 @@ func runVideoPollLoop(ctx context.Context, taskID string, policy videoPollPolicy
 		}
 		notFoundMisses = 0
 		malformedResponses = 0
+		transientFailures = 0
 		nextDelay = policy.Interval
 		if retrying {
 			retrying = false
